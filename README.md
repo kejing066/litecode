@@ -3,25 +3,33 @@
 lite is a lite agentic coding tool: a full-screen chat TUI and a headless
 mode, both running one coding task through a chat LLM in a small agent
 loop. "Lite" means the context and prompt sent to the LLM are small: a
-minimal system prompt, the single `sh` tool, truncated tool output, and a
-capped message history. The project is fully implemented: tool + TUI +
-OpenCode-style model configuration + `install.sh` + tests + docs.
+minimal system prompt, one `sh` tool, truncated tool output, and a capped
+message history.
+
+## Backends
+
+- **openai** (default) — any OpenAI-compatible chat-completions endpoint
+  (`providers.<id>.settings.baseURL`, env `LITECODE_API_BASE`, keys via
+  `LITECODE_API_KEY` or `<PROVIDER>_API_KEY`).
+- **codex** — OpenAI Codex (the Codex CLI backend): lite talks the
+  Responses API at `https://chatgpt.com/backend-api/codex/responses` and
+  reuses Codex's `~/.codex/auth.json` ChatGPT login.
+- **agy** — Google Antigravity CLI: lite proxies the task to `agy -p`
+  (print mode) and returns its reply.
 
 ## TUI
 
-Run `lite` (or `lite --tui`) for a full-screen chat TUI:
-
-- Type a task, press Enter: the model runs, tool calls show up live, and
-  the final reply appears.
-- `/model [id]` — show or set the current model (e.g. `openai/gpt-4o`).
-- `/help`, `/quit` — help and exit (Ctrl+C also exits).
+Run `lite` (or `lite --tui`) for a full-screen chat TUI: type a task +
+Enter, tool calls/steps stream by, `*` assistant replies. `/model [id]`
+switches models, `/help`, `/quit` (or Ctrl+C).
 
 ## Headless
 
 ```
 lite "fix the failing test in test_app.py"
+lite --model codex/gpt-5-codex "do the task"
+lite --provider agy "do the task"
 lite --steps 10 --trace "refactor the parser"
-lite --model openai/gpt-4o "do the task"
 ```
 
 Prints the model's final reply. `--steps` caps the agent loop; `--trace`
@@ -34,28 +42,26 @@ curl https://raw.githubusercontent.com/kejing066/litecode/main/install.sh | sh
 ```
 
 Installs `lite` to `~/.local/bin` and starts its TUI. Overrides:
-
-- `LITE_INSTALL_DIR` — install dir (default `~/.local/bin`)
-- `LITE_REPO_URL` — repo base URL
-- `LITE_INSTALL_ONLY=1` — install without running the TUI
-- `LITECODE_CONFIG_DIR` / `LITECODE_OPENCODE_CONFIG_DIR` — config dirs
-  (see below)
+`LITE_INSTALL_DIR`, `LITE_REPO_URL`, `LITE_INSTALL_ONLY=1`; `AGY_BINARY`
+when using the agy backend. Set `LITECODE_CONFIG_DIR` /
+`LITECODE_OPENCODE_CONFIG_DIR` to redirect lite's config dirs.
 
 ## Model configuration (OpenCode-style)
 
-lite configures models the way OpenCode does: `provider/model` selectors
-and a `providers` map with `settings.baseURL`/`settings.apiKey`.
+Models are configured like OpenCode, with provider + model entries:
 
-Files read (later overrides earlier):
+- Files read (later overrides earlier): `~/.config/lite/opencode.json(c)`
+  (override dir: `LITECODE_CONFIG_DIR`), `~/.config/opencode/opencode.json(c)`
+  (override: `LITECODE_OPENCODE_CONFIG_DIR`), then `lite.json`/`lite.jsonc`/
+  `opencode.json`/`opencode.jsonc` in the project dir.
+- Top-level `model`: `provider/model` or
+  `{"providerID": ..., "model": ...}`.
+- `providers.<id>` entries: `name`, `env` (credential env vars),
+  `settings` (`baseURL`/`apiKey`), `models`, and — lite's addition —
+  `type`: `openai` (default) | `codex` | `agy`.
+- `{env:VAR}` substitutions, like OpenCode's config variables.
 
-1. Global lite config: `~/.config/lite/opencode.json(c)` — override the
-   dir with `LITECODE_CONFIG_DIR`.
-2. OpenCode-compatible global: `~/.config/opencode/opencode.json(c)` —
-   override with `LITECODE_OPENCODE_CONFIG_DIR`.
-3. Project files (cwd): `lite.json`, `lite.jsonc`, then
-   `opencode.json`, `opencode.jsonc` (projects override global files).
-
-Example `lite.json` (JSON or JSONC with `//` comments and trailing commas):
+Example `lite.json` (JSON or JSONC):
 
 ```jsonc
 {
@@ -63,10 +69,7 @@ Example `lite.json` (JSON or JSONC with `//` comments and trailing commas):
   "providers": {
     "openai": {
       "name": "OpenAI",
-      "settings": {
-        "baseURL": "https://api.openai.com/v1",
-        "apiKey": "sk-..."
-      }
+      "settings": { "baseURL": "https://api.openai.com/v1", "apiKey": "sk-..." }
     },
     "openrouter": {
       "name": "OpenRouter",
@@ -78,24 +81,24 @@ Example `lite.json` (JSON or JSONC with `//` comments and trailing commas):
 }
 ```
 
-Notes:
+Env: `LITECODE_MODEL`/`LITECODE_PROVIDER` override the config root;
+`LITECODE_API_KEY`/`LITECODE_API_BASE` are honored; for codex:
+`CODEX_API_KEY`/`OPENAI_API_KEY`/`CODEX_ACCESS_TOKEN`/`~/.codex/auth.json`.
 
-- Root `model` accepts `provider/model` or the object form
-  `{"providerID": "openai", "model": "gpt-4o"}`.
-- Root `provider` (lite-native convenience) sets the provider when the
-  model reference has no prefix.
-- `{env:VAR}` substitutions in config are resolved like OpenCode's
-  config variables.
-- Credentials: `settings.apiKey`, the provider's `env` list, the
-  conventional `{PROVIDER}_API_KEY` (e.g. `OPENAI_API_KEY`), or
-  `LITECODE_API_KEY`.
+## Module layout
 
-Model selection:
-
-1. `lite --model openai/gpt-4o` (flag)
-2. `LITECODE_MODEL` env
-3. config root `model`
-4. default `openai/gpt-4o-mini`
+```
+lite/
+  __init__.py  re-exports the public API (lite.sh, lite.run_task, lite.main, ...)
+  cli.py       main() — argparse entry point
+  agent.py     run_task() — the agent loop
+  llm.py       call_llm() dispatcher: call_chat_completions(), call_codex(),
+               call_agy()/run_agy() (pty runner for the agy backend)
+  config.py    load_config(), resolve_config(), provider_env_key(), ...
+  tools.py     sh() tool + schema
+  tui.py       the chat TUI
+  __main__.py  python -m lite
+```
 
 ## Tests
 

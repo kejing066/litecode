@@ -6,12 +6,14 @@
 # Overrides:
 #   LITE_REPO_URL      default: https://raw.githubusercontent.com/kejing066/litecode/main
 #   LITE_INSTALL_DIR   default: $HOME/.local/bin
-#   LITECODE_CONFIG_DIR / LITECODE_OPENCODE_CONFIG_DIR (passed through to lite)
 #   LITE_INSTALL_ONLY=1  install without running the TUI
+#   LITECODE_CONFIG_DIR / LITECODE_OPENCODE_CONFIG_DIR (passed through to lite)
 set -eu
 
 LITE_REPO_URL="${LITE_REPO_URL:-https://raw.githubusercontent.com/kejing066/litecode/main}"
 LITE_INSTALL_DIR="${LITE_INSTALL_DIR:-$HOME/.local/bin}"
+LITE_SRC="$LITE_INSTALL_DIR/src"
+LITE_PKG="$LITE_SRC/lite"
 LITE_BIN="$LITE_INSTALL_DIR/lite"
 
 die() {
@@ -29,12 +31,28 @@ else
     die "curl or wget is required (neither found on PATH)"
 fi
 
-mkdir -p "$LITE_INSTALL_DIR" || die "cannot create directory $LITE_INSTALL_DIR"
+# Files of the lite package, relative to the repo root.
+LITE_FILES="__init__.py __main__.py agent.py cli.py config.py llm.py tools.py tui.py"
 
-fetch "$LITE_REPO_URL/lite.py" "$LITE_BIN" \
-    || die "failed to download $LITE_REPO_URL/lite.py"
+mkdir -p "$LITE_PKG" || die "cannot create directory $LITE_PKG"
+for f in $LITE_FILES; do
+    fetch "$LITE_REPO_URL/lite/$f" "$LITE_PKG/$f" \
+        || die "failed to download $LITE_REPO_URL/lite/$f"
+    [ -s "$LITE_PKG/$f" ] || die "empty download from $LITE_REPO_URL/lite/$f"
+done
+
+# Launcher: `lite` runs the package from $LITE_SRC.
+cat > "$LITE_BIN" <<EOF
+#!/usr/bin/env python3
+import sys
+
+sys.path.insert(0, "$LITE_SRC")
+
+from lite.cli import main
+
+sys.exit(main())
+EOF
 chmod +x "$LITE_BIN"
-[ -s "$LITE_BIN" ] || die "empty download from $LITE_REPO_URL/lite.py"
 
 echo "installed lite to $LITE_BIN"
 

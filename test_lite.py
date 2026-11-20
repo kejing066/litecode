@@ -5,7 +5,9 @@ import io
 import json
 import os
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest import mock
 
 import lite
@@ -64,7 +66,7 @@ class ShTests(LiteTestCase):
         self.assertIn("exit code: 3", lite.sh("exit 3"))
 
     def test_output_is_truncated(self):
-        with mock.patch.object(lite, "TOOL_OUTPUT_LIMIT", 5):
+        with mock.patch.object(lite.tools, "TOOL_OUTPUT_LIMIT", 5):
             out = lite.sh("echo hello")
         self.assertIn("[truncated", out)
         self.assertNotIn("hello", out)
@@ -181,6 +183,24 @@ class ConfigTests(LiteTestCase):
             cfg = lite.resolve_config({})
         self.assertEqual(cfg["base_url"], "https://proxy.example/v1")
 
+    def test_resolve_config_codex_defaults(self):
+        cfg = lite.resolve_config({}, model="codex/gpt-5-codex")
+        self.assertEqual(cfg["provider"], "codex")
+        self.assertEqual(cfg["type"], "codex")
+        self.assertEqual(cfg["model"], "gpt-5-codex")
+        self.assertEqual(cfg["base_url"], "https://chatgpt.com/backend-api/codex")
+
+    def test_resolve_config_codex_auth_env(self):
+        with mock.patch.dict(os.environ, {"CODEX_API_KEY": "codex-env-key"}):
+            cfg = lite.resolve_config({}, model="codex/gpt-5-codex")
+        self.assertEqual(cfg["api_key"], "codex-env-key")
+
+    def test_resolve_config_agy_defaults(self):
+        cfg = lite.resolve_config({}, provider="agy")
+        self.assertEqual(cfg["provider"], "agy")
+        self.assertEqual(cfg["type"], "agy")
+        self.assertIsNone(cfg["base_url"])
+
     def test_call_llm_requires_api_key(self):
         cfg = {
             "provider": "openai",
@@ -198,6 +218,94 @@ class ConfigTests(LiteTestCase):
             lite.call_llm([], cfg)
         self.assertIn("base URL", str(ctx.exception))
 
+    def test_call_llm_dispatches_by_type(self):
+        for ptype, fn_name in (
+            ("agy", "call_agy"),
+            ("codex", "call_codex"),
+            ("openai", "call_chat_completions"),
+        ):
+            with mock.patch.object(
+                lite.llm, fn_name, return_value=("x", [])
+            ) as fake:
+                lite.call_llm([], {"type": ptype})
+            fake.assert_called_once()
+
+
+class CodexStubTests(LiteTestCase):
+    """call_codex against a stub Responses server (openai/codex wire format)."""
+
+    def test_call_codex_parses_output(self):
+        recorded = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+                recorded.append((self.headers, body))
+                if len(recorded) == 1:
+                    message = {
+                        "type": "function_call",
+                        "name": "sh",
+                        "arguments": json.dumps({"command": "echo codex-stub"}),
+                        "call_id": "call_0",
+                    }
+                else:
+                    message = {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "codex done"}],
+                    }
+                payload = json.dumps({"output": [message]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            config = lite.resolve_config(
+                {
+                    "providers": {
+                        "codex": {"settings": {"baseURL": f"http://127.0.0.1:{port}"}}
+                    }
+                },
+                model="codex/gpt-5-codex",
+            )
+            config["api_key"] = "stub-key"
+            config["account_id"] = "acct-123"
+            messages = [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "do it"},
+            ]
+            text, calls = lite.call_codex(messages, config)
+            self.assertEqual(calls, [("sh", {"command": "echo codex-stub"})])
+            headers, body = recorded[0]
+            self.assertEqual(body["model"], "gpt-5-codex")
+            self.assertEqual(body["input"][0]["role"], "user")
+            self.assertEqual(
+                body["input"][0]["content"], [{"type": "input_text", "text": "sys"}]
+            )
+            self.assertEqual(body["input"][1]["role"], "user")
+            self.assertEqual(body["tool_choice"], "auto")
+            self.assertFalse(body["parallel_tool_calls"])
+            self.assertFalse(body["store"])
+            self.assertEqual(headers.get("Authorization"), "Bearer stub-key")
+            self.assertEqual(headers.get("chatgpt-account-id"), "acct-123")
+            # Second call returns the assistant message.
+            text, calls = lite.call_codex(messages, config)
+            self.assertEqual(text, "codex done")
+            self.assertEqual(calls, [])
+        finally:
+            server.shutdown()
+            server.server_close()
+
 
 class RunTaskTests(LiteTestCase):
     def test_runs_tool_then_finishes(self):
@@ -210,7 +318,7 @@ class RunTaskTests(LiteTestCase):
             seen_configs.append(config)
             return _calls_of(next(replies))
 
-        with mock.patch.object(lite, "call_llm", fake_call_llm):
+        with mock.patch.object(lite.agent, "call_llm", fake_call_llm):
             result = lite.run_task("run a command")
         self.assertEqual(result, "done")
         self.assertEqual(seen_configs[0]["model"], lite.DEFAULT_MODEL)
@@ -218,14 +326,16 @@ class RunTaskTests(LiteTestCase):
         self.assertTrue(any("hi" in m["content"] for m in tool_msgs))
 
     def test_final_message_without_tools(self):
-        with mock.patch.object(lite, "call_llm", return_value=("all done", [])):
+        with mock.patch.object(
+            lite.agent, "call_llm", return_value=("all done", [])
+        ):
             self.assertEqual(lite.run_task("finish"), "all done")
 
     def test_step_limit(self):
         def fake_call_llm(messages, config=None):
             return "", [("sh", {"command": "echo x"})]
 
-        with mock.patch.object(lite, "call_llm", fake_call_llm):
+        with mock.patch.object(lite.agent, "call_llm", fake_call_llm):
             self.assertEqual(lite.run_task("loop", steps=2), "hit step limit")
 
     def test_on_event_events(self):
@@ -237,7 +347,7 @@ class RunTaskTests(LiteTestCase):
         def on_event(role, text):
             events.append((role, text))
 
-        with mock.patch.object(lite, "call_llm", fake_call_llm):
+        with mock.patch.object(lite.agent, "call_llm", fake_call_llm):
             result = lite.run_task("task", steps=1, on_event=on_event)
         self.assertEqual(result, "hit step limit")
         self.assertIn(("status", "step 1"), events)
@@ -256,10 +366,43 @@ class RunTaskTests(LiteTestCase):
         self.assertEqual(capped[1]["content"], "u")
         self.assertEqual(capped[-1]["content"], "a39")
 
+    def test_run_task_with_codex(self):
+        with mock.patch.object(
+            lite.llm, "call_codex", return_value=("codex says hi", [])
+        ):
+            result = lite.run_task(
+                "do it", config=lite.resolve_config({}, model="codex/gpt-5-codex")
+            )
+        self.assertEqual(result, "codex says hi")
+
+    def test_run_task_with_agy(self):
+        with mock.patch.object(
+            lite.llm, "call_agy", return_value=("agy says hi", [])
+        ):
+            result = lite.run_task(
+                "do it", config=lite.resolve_config({}, provider="agy")
+            )
+        self.assertEqual(result, "agy says hi")
+
+
+class AgyTests(LiteTestCase):
+    def test_call_agy_runs_agy_cli(self):
+        fake = os.path.join(self.tmp, "agy")
+        with open(fake, "w") as fh:
+            fh.write("#!/bin/sh\necho agy-stub output\n")
+        os.chmod(fake, 0o755)
+        config = lite.resolve_config({"provider": "agy", "providers": {"agy": {}}})
+        with mock.patch.dict(os.environ, {"AGY_BINARY": fake}):
+            text, calls = lite.call_agy(
+                [{"role": "user", "content": "do the task"}], config
+            )
+        self.assertEqual(calls, [])
+        self.assertIn("agy-stub output", text)
+
 
 class MainTests(LiteTestCase):
     def test_headless_missing_key(self):
-        with mock.patch.object(lite, "load_config", return_value={}):
+        with mock.patch.object(lite.cli, "load_config", return_value={}):
             with contextlib.redirect_stderr(io.StringIO()):
                 code = lite.main(["do a thing"])
         self.assertEqual(code, 2)
@@ -270,22 +413,22 @@ class MainTests(LiteTestCase):
             return "task done"
 
         with mock.patch.dict(os.environ, {"LITECODE_API_KEY": "k"}):
-            with mock.patch.object(lite, "load_config", return_value={}):
-                with mock.patch.object(lite, "run_task", fake_run_task):
+            with mock.patch.object(lite.cli, "load_config", return_value={}):
+                with mock.patch.object(lite.cli, "run_task", fake_run_task):
                     with contextlib.redirect_stdout(io.StringIO()) as out:
                         code = lite.main(["do a thing"])
         self.assertEqual(code, 0)
         self.assertEqual(out.getvalue().strip(), "task done")
 
     def test_main_dispatches_tui(self):
-        with mock.patch.object(lite, "run_tui", return_value=3) as fake_tui:
+        with mock.patch.object(lite.cli, "run_tui", return_value=3) as fake_tui:
             code = lite.main([])
         self.assertEqual(code, 3)
         fake_tui.assert_called_once()
         self.assertIsNone(fake_tui.call_args.kwargs.get("initial_task"))
 
     def test_main_tui_with_task(self):
-        with mock.patch.object(lite, "run_tui", return_value=0) as fake_tui:
+        with mock.patch.object(lite.cli, "run_tui", return_value=0) as fake_tui:
             code = lite.main(["--tui", "some task"])
         self.assertEqual(code, 0)
         self.assertEqual(
